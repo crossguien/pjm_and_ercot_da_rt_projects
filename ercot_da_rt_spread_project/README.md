@@ -30,13 +30,16 @@ python src/main.py --node "HB_HOUSTON" --days 60 --fallback-sample --outdir outp
 ## Key outputs and how to interpret them
 
 * DA vs RT spread distributions
-  - Used to evaluate skew and tail risk, particularly around scarcity events.
+
+  Used to evaluate skew and tail risk, particularly around scarcity events.
 
 * Hourly and daily seasonality diagnostics
-  - Highlight periods where DA prices systematically underprice RT volatility, often during peak load or ramp hours.
+
+  Highlight periods where DA prices systematically underprice RT volatility, often during peak load or ramp hours.
 
 * Spread summary tables
- - Quantify mean, variance, and tail behavior to support position sizing and risk limits.
+
+  Quantify mean, variance, and tail behavior to support position sizing and risk limits.
 
 For example, persistent positive RT-DA skew during summer peak hours indicates upside scarcity risk not fully priced in DA, favoring conservative DA offers or long RT exposure.
 
