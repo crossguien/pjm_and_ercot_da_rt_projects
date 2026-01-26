@@ -12,6 +12,7 @@ Run:
 from __future__ import annotations
 
 import argparse
+import inspect
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -68,6 +69,17 @@ def _normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _supports_market_arg(func) -> bool:
+    try:
+        sig = inspect.signature(func)
+    except (TypeError, ValueError):
+        return False
+    for p in sig.parameters.values():
+        if p.kind == inspect.Parameter.VAR_KEYWORD:
+            return True
+    return "market" in sig.parameters
+
+
 def download_prices(iso, start: pd.Timestamp, end: pd.Timestamp, node: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     def _call_get_lmp(**kwargs) -> pd.DataFrame:
         try:
@@ -84,24 +96,22 @@ def download_prices(iso, start: pd.Timestamp, end: pd.Timestamp, node: str) -> t
             raise
 
     def _fetch_market(market_name: str) -> pd.DataFrame:
-        try:
+        if _supports_market_arg(iso.get_lmp):
             return _call_get_lmp(date=start, end=end, market=market_name)
-        except TypeError as e:
-            if "unexpected keyword argument 'market'" not in str(e):
-                raise
-            df_all = _call_get_lmp(date=start, end=end)
-            if "market" not in df_all.columns:
-                raise ValueError("LMP data missing 'market' column; cannot split DA/RT")
 
-            def _norm_val(val: str) -> str:
-                return str(val).lower().replace(" ", "").replace("_", "")
+        df_all = _call_get_lmp(date=start, end=end)
+        if "market" not in df_all.columns:
+            raise ValueError("LMP data missing 'market' column; cannot split DA/RT")
 
-            mask = df_all["market"].apply(_norm_val) == _norm_val(market_name)
-            if not mask.any():
-                raise ValueError(
-                    f"No rows for market '{market_name}' in LMP data; markets available: {df_all['market'].unique()}"
-                )
-            return df_all.loc[mask].copy()
+        def _norm_val(val: str) -> str:
+            return str(val).lower().replace(" ", "").replace("_", "")
+
+        mask = df_all["market"].apply(_norm_val) == _norm_val(market_name)
+        if not mask.any():
+            raise ValueError(
+                f"No rows for market '{market_name}' in LMP data; markets available: {df_all['market'].unique()}"
+            )
+        return df_all.loc[mask].copy()
 
     da = _fetch_market("day_ahead")
     rt = _fetch_market("real_time")
