@@ -19,7 +19,6 @@ from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 
 from sklearn.metrics import mean_absolute_error, r2_score
 from sklearn.ensemble import RandomForestRegressor
@@ -43,6 +42,9 @@ class Config:
     outdir: str
     seed: int = 7
     end_date: str | None = None
+    mode: str = "online"
+    fallback_sample: bool = False
+    demo: bool = False
 
 
 def ensure_dirs(outdir: str) -> dict:
@@ -67,6 +69,21 @@ def _normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
     return df
+
+
+def _load_sample_data(node: str) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    base = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "sample_data"))
+    da_path = os.path.join(base, "da_prices.csv")
+    rt_path = os.path.join(base, "rt_prices.csv")
+    load_path = os.path.join(base, "load.csv")
+
+    da = pd.read_csv(da_path, parse_dates=["time"])
+    rt = pd.read_csv(rt_path, parse_dates=["time"])
+    load_df = pd.read_csv(load_path, parse_dates=["time"])
+
+    da = da[da["node"] == node].copy()
+    rt = rt[rt["node"] == node].copy()
+    return da, rt, load_df
 
 
 def _supports_market_arg(func) -> bool:
@@ -225,6 +242,7 @@ def train_model(df: pd.DataFrame, cfg: Config, paths: dict) -> dict:
 
 def plot_outputs(df: pd.DataFrame, cfg: Config, paths: dict) -> dict:
     fig_paths = {}
+    import matplotlib.pyplot as plt
 
     plt.figure()
     df.set_index("time")["da_rt_spread"].rolling(24).mean().plot()
@@ -317,25 +335,54 @@ def parse_args() -> Config:
     ap.add_argument("--outdir", type=str, default="outputs", help="Output directory")
     ap.add_argument("--seed", type=int, default=7, help="Random seed")
     ap.add_argument("--end-date", type=str, default=None, help="End date YYYY-MM-DD (default: today UTC)")
+    ap.add_argument("--mode", choices=["online", "offline"], default="online", help="Use live data or bundled sample data")
+    ap.add_argument("--fallback-sample", action="store_true", help="Use sample data if live fetch fails")
+    ap.add_argument("--demo", action="store_true", help="Skip model training/plots for a fast demo run")
     args = ap.parse_args()
-    return Config(node=args.node, days=args.days, outdir=args.outdir, seed=args.seed, end_date=args.end_date)
+    return Config(
+        node=args.node,
+        days=args.days,
+        outdir=args.outdir,
+        seed=args.seed,
+        end_date=args.end_date,
+        mode=args.mode,
+        fallback_sample=args.fallback_sample,
+        demo=args.demo,
+    )
 
 
 def main() -> None:
     cfg = parse_args()
     paths = ensure_dirs(cfg.outdir)
 
-    iso = PJM()
     start, end = utc_date_range(cfg.days, cfg.end_date)
 
-    da, rt_h = download_prices(iso, start=start, end=end, node=cfg.node)
-    load_df = download_load_features(iso, start=start, end=end)
+    if cfg.mode == "offline":
+        da, rt_h, load_df = _load_sample_data(cfg.node)
+    else:
+        try:
+            iso = PJM()
+            da, rt_h = download_prices(iso, start=start, end=end, node=cfg.node)
+            load_df = download_load_features(iso, start=start, end=end)
+        except Exception:
+            if not cfg.fallback_sample:
+                raise
+            print("Live data fetch failed (or missing API key); falling back to sample data.")
+            da, rt_h, load_df = _load_sample_data(cfg.node)
 
     df = build_feature_table(da, rt_h, load_df)
+    if df.empty:
+        raise ValueError("No overlapping DA/RT rows; try --mode offline or adjust --node/--days.")
     data_path = save_data(df, cfg, paths)
-    figs = plot_outputs(df, cfg, paths)
-    metrics = train_model(df, cfg, paths)
-    report_path = write_report(cfg, paths, metrics, df, figs)
+    if cfg.demo:
+        metrics = {"model_path": "n/a", "mae": float("nan"), "r2": float("nan"), "n_train": 0, "n_test": 0, "features": []}
+        figs = {}
+        report_path = write_report(cfg, paths, metrics, df, figs)
+        print("Demo mode: skipped model training and plots.")
+    else:
+        figs = plot_outputs(df, cfg, paths)
+        metrics = train_model(df, cfg, paths)
+        report_path = write_report(cfg, paths, metrics, df, figs)
 
     print("Saved feature table:", data_path)
     print("Saved report:", report_path)

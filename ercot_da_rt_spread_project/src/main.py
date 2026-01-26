@@ -19,7 +19,6 @@ from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 
 from sklearn.metrics import mean_absolute_error, r2_score
 from sklearn.ensemble import RandomForestRegressor
@@ -43,6 +42,9 @@ class Config:
     outdir: str
     seed: int = 7
     end_date: str | None = None
+    mode: str = "online"
+    fallback_sample: bool = False
+    demo: bool = False
 
 
 def ensure_dirs(outdir: str) -> dict:
@@ -80,7 +82,108 @@ def _supports_market_arg(func) -> bool:
     return "market" in sig.parameters
 
 
+def _pick_time_col(df: pd.DataFrame) -> str:
+    if "time" in df.columns:
+        return "time"
+    if "interval_start" in df.columns:
+        return "interval_start"
+    raise ValueError("Could not find a time column in price data")
+
+
+def _pick_price_col(df: pd.DataFrame) -> str:
+    for col in ("lmp", "spp", "price", "settlement_point_price", "energy_settlement_point_price"):
+        if col in df.columns:
+            return col
+    raise ValueError("Could not find a price column in price data")
+
+
+def _align_timestamp_to_series(ts: pd.Timestamp, series: pd.Series) -> pd.Timestamp:
+    if isinstance(series.dtype, pd.DatetimeTZDtype):
+        tz = series.dt.tz
+        if ts.tzinfo is None:
+            return ts.tz_localize(tz)
+        return ts.tz_convert(tz)
+    if ts.tzinfo is not None:
+        return ts.tz_localize(None)
+    return ts
+
+
+def _load_sample_data(node: str) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    base = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "sample_data"))
+    da_path = os.path.join(base, "da_prices.csv")
+    rt_path = os.path.join(base, "rt_prices.csv")
+    load_path = os.path.join(base, "load.csv")
+
+    da = pd.read_csv(da_path, parse_dates=["time"])
+    rt = pd.read_csv(rt_path, parse_dates=["time"])
+    load_df = pd.read_csv(load_path, parse_dates=["time"])
+
+    da = da[da["node"] == node].copy()
+    rt = rt[rt["node"] == node].copy()
+    return da, rt, load_df
+
+
+def _download_ercot_prices(iso, start: pd.Timestamp, end: pd.Timestamp, node: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    target_tz = None
+    years = range(start.year, end.year + 1)
+    dam_parts = []
+    for year in years:
+        dam_year = _normalize_cols(iso.get_dam_spp(year))
+        time_col = _pick_time_col(dam_year)
+        if isinstance(dam_year[time_col].dtype, pd.DatetimeTZDtype):
+            target_tz = dam_year[time_col].dt.tz
+        start_cmp = _align_timestamp_to_series(start, dam_year[time_col])
+        end_cmp = _align_timestamp_to_series(end, dam_year[time_col])
+        dam_year = dam_year[(dam_year[time_col] >= start_cmp) & (dam_year[time_col] < end_cmp)]
+        dam_parts.append(dam_year)
+
+    if not dam_parts:
+        raise ValueError("No DAM data returned for the requested date range")
+
+    dam = pd.concat(dam_parts, ignore_index=True)
+    if "market" in dam.columns:
+        dam = dam[dam["market"].str.lower().str.contains("day_ahead")]
+
+    node_col = "location" if "location" in dam.columns else None
+    if node_col is None:
+        raise ValueError("Could not find a location column in DAM data")
+
+    time_col = _pick_time_col(dam)
+    price_col = _pick_price_col(dam)
+    da_n = dam[dam[node_col] == node].copy()
+    da_n = da_n.rename(columns={time_col: "time", node_col: "node", price_col: "da_lmp"})[["time", "node", "da_lmp"]]
+
+    if target_tz is None:
+        target_tz = "US/Central"
+    if start.tzinfo is None:
+        start_c = start.tz_localize(target_tz)
+    else:
+        start_c = start.tz_convert(target_tz)
+    if end.tzinfo is None:
+        end_c = end.tz_localize(target_tz)
+    else:
+        end_c = end.tz_convert(target_tz)
+
+    rt = _normalize_cols(iso.get_lmp(date=start_c, end=end_c))
+    rt_time_col = _pick_time_col(rt)
+    rt_price_col = _pick_price_col(rt)
+    rt_node_col = "location" if "location" in rt.columns else ("node" if "node" in rt.columns else None)
+    if rt_node_col is None:
+        raise ValueError("Could not find a node/location column in RT LMP data")
+
+    rt_n = rt[rt[rt_node_col] == node].copy()
+    rt_n = rt_n.rename(columns={rt_time_col: "time", rt_node_col: "node", rt_price_col: "rt_lmp"})
+    rt_n["time_hour"] = rt_n["time"].dt.floor("h")
+    rt_h = rt_n.groupby(["time_hour", "node"], as_index=False).agg(rt_lmp=("rt_lmp", "mean"))
+    rt_h = rt_h.rename(columns={"time_hour": "time"})[["time", "node", "rt_lmp"]]
+
+    return da_n, rt_h
+
+
 def download_prices(iso, start: pd.Timestamp, end: pd.Timestamp, node: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if iso.__class__.__name__.lower() == "ercot" and hasattr(iso, "get_dam_spp"):
+        return _download_ercot_prices(iso, start=start, end=end, node=node)
+
     def _call_get_lmp(**kwargs) -> pd.DataFrame:
         try:
             df = iso.get_lmp(**kwargs)
@@ -225,6 +328,7 @@ def train_model(df: pd.DataFrame, cfg: Config, paths: dict) -> dict:
 
 def plot_outputs(df: pd.DataFrame, cfg: Config, paths: dict) -> dict:
     fig_paths = {}
+    import matplotlib.pyplot as plt
 
     plt.figure()
     df.set_index("time")["da_rt_spread"].rolling(24).mean().plot()
@@ -317,25 +421,54 @@ def parse_args() -> Config:
     ap.add_argument("--outdir", type=str, default="outputs", help="Output directory")
     ap.add_argument("--seed", type=int, default=7, help="Random seed")
     ap.add_argument("--end-date", type=str, default=None, help="End date YYYY-MM-DD (default: today UTC)")
+    ap.add_argument("--mode", choices=["online", "offline"], default="online", help="Use live data or bundled sample data")
+    ap.add_argument("--fallback-sample", action="store_true", help="Use sample data if live fetch fails")
+    ap.add_argument("--demo", action="store_true", help="Skip model training/plots for a fast demo run")
     args = ap.parse_args()
-    return Config(node=args.node, days=args.days, outdir=args.outdir, seed=args.seed, end_date=args.end_date)
+    return Config(
+        node=args.node,
+        days=args.days,
+        outdir=args.outdir,
+        seed=args.seed,
+        end_date=args.end_date,
+        mode=args.mode,
+        fallback_sample=args.fallback_sample,
+        demo=args.demo,
+    )
 
 
 def main() -> None:
     cfg = parse_args()
     paths = ensure_dirs(cfg.outdir)
 
-    iso = Ercot()
     start, end = utc_date_range(cfg.days, cfg.end_date)
 
-    da, rt_h = download_prices(iso, start=start, end=end, node=cfg.node)
-    load_df = download_load_features(iso, start=start, end=end)
+    if cfg.mode == "offline":
+        da, rt_h, load_df = _load_sample_data(cfg.node)
+    else:
+        iso = Ercot()
+        try:
+            da, rt_h = download_prices(iso, start=start, end=end, node=cfg.node)
+            load_df = download_load_features(iso, start=start, end=end)
+        except Exception:
+            if not cfg.fallback_sample:
+                raise
+            print("Live data fetch failed; falling back to sample data.")
+            da, rt_h, load_df = _load_sample_data(cfg.node)
 
     df = build_feature_table(da, rt_h, load_df)
+    if df.empty:
+        raise ValueError("No overlapping DA/RT rows; try --mode offline or adjust --node/--days.")
     data_path = save_data(df, cfg, paths)
-    figs = plot_outputs(df, cfg, paths)
-    metrics = train_model(df, cfg, paths)
-    report_path = write_report(cfg, paths, metrics, df, figs)
+    if cfg.demo:
+        metrics = {"model_path": "n/a", "mae": float("nan"), "r2": float("nan"), "n_train": 0, "n_test": 0, "features": []}
+        figs = {}
+        report_path = write_report(cfg, paths, metrics, df, figs)
+        print("Demo mode: skipped model training and plots.")
+    else:
+        figs = plot_outputs(df, cfg, paths)
+        metrics = train_model(df, cfg, paths)
+        report_path = write_report(cfg, paths, metrics, df, figs)
 
     print("Saved feature table:", data_path)
     print("Saved report:", report_path)
