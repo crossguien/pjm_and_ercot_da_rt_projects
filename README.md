@@ -53,4 +53,3 @@ python src/main.py --node "HB_HOUSTON" --mode offline --outdir outputs
 ## Notes
 
 - Generated artifacts are intentionally ignored at repo root to keep version control focused on source code and documentation.
-- The root `.DS_Store` file should be removed from tracking if still visible on GitHub.
