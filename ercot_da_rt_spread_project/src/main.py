@@ -26,11 +26,8 @@ import joblib
 
 try:
     from gridstatus import Ercot
-except Exception as e:
-    raise SystemExit(
-        "Missing dependency gridstatus. Install with: pip install -r requirements.txt\n"
-        f"Original error: {e}"
-    )
+except Exception:
+    Ercot = None
 
 UTC = timezone.utc
 
@@ -184,6 +181,11 @@ def download_prices(iso, start: pd.Timestamp, end: pd.Timestamp, node: str) -> t
     if iso.__class__.__name__.lower() == "ercot" and hasattr(iso, "get_dam_spp"):
         return _download_ercot_prices(iso, start=start, end=end, node=node)
 
+    market_aliases = {
+        "day_ahead": ["day_ahead", "DAY_AHEAD_HOURLY", "DAY_AHEAD_HOURLY_EX_ANTE", "DAY_AHEAD_HOURLY_EX_POST"],
+        "real_time": ["real_time", "REAL_TIME_HOURLY", "REAL_TIME_5_MIN", "REAL_TIME_HOURLY_FINAL"],
+    }
+
     def _call_get_lmp(**kwargs) -> pd.DataFrame:
         try:
             df = iso.get_lmp(**kwargs)
@@ -200,16 +202,26 @@ def download_prices(iso, start: pd.Timestamp, end: pd.Timestamp, node: str) -> t
 
     def _fetch_market(market_name: str) -> pd.DataFrame:
         if _supports_market_arg(iso.get_lmp):
-            return _call_get_lmp(date=start, end=end, market=market_name)
+            errs = []
+            for market in market_aliases.get(market_name, [market_name]):
+                try:
+                    return _call_get_lmp(date=start, end=end, market=market)
+                except ValueError as e:
+                    errs.append(str(e))
+            raise ValueError(
+                f"Unable to fetch market '{market_name}' using aliases {market_aliases.get(market_name, [market_name])}. "
+                f"Last error: {errs[-1] if errs else 'unknown'}"
+            )
 
         df_all = _call_get_lmp(date=start, end=end)
         if "market" not in df_all.columns:
             raise ValueError("LMP data missing 'market' column; cannot split DA/RT")
 
         def _norm_val(val: str) -> str:
-            return str(val).lower().replace(" ", "").replace("_", "")
+            return "".join(ch for ch in str(val).lower() if ch.isalnum())
 
-        mask = df_all["market"].apply(_norm_val) == _norm_val(market_name)
+        normalized_candidates = {_norm_val(v) for v in market_aliases.get(market_name, [market_name])}
+        mask = df_all["market"].apply(_norm_val).isin(normalized_candidates)
         if not mask.any():
             raise ValueError(
                 f"No rows for market '{market_name}' in LMP data; markets available: {df_all['market'].unique()}"
@@ -446,6 +458,8 @@ def main() -> None:
     if cfg.mode == "offline":
         da, rt_h, load_df = _load_sample_data(cfg.node)
     else:
+        if Ercot is None:
+            raise SystemExit("Missing dependency gridstatus. Install with: pip install -r requirements.txt")
         iso = Ercot()
         try:
             da, rt_h = download_prices(iso, start=start, end=end, node=cfg.node)

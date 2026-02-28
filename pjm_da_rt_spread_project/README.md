@@ -28,6 +28,15 @@ python src/main.py --node "PJM RTO" --mode offline --demo --outdir outputs
 
 # Online with automatic fallback to sample data if live fetch fails
 python src/main.py --node "PJM RTO" --days 60 --fallback-sample --outdir outputs
+
+# Strategy backtest with risk layer tuning
+python src/main.py --node "PJM RTO" --mode offline --outdir outputs \
+  --entry-z 0.7 \
+  --base-mw 12 \
+  --max-mw 60 \
+  --trade-cost-per-mwh 0.25 \
+  --risk-budget-per-trade 300 \
+  --daily-loss-limit 1500
 ```
 
 ## Key outputs and how to interpret them
@@ -79,3 +88,18 @@ For example, widening variance without a change in mean suggests higher risk per
 ## Data source
 Pulled from public market data via the open-source `gridstatus` library.
 If you want a specific hub or node, start by running the script once and inspect the returned location names in the raw data.
+
+## Virtuals Strategy Backtest (DA vs RT + Risk Layer)
+The project now includes an out-of-sample virtuals strategy report with:
+- Entry signals from predicted DA-RT spread normalized by rolling realized volatility
+- Clear trade rules: positive signal -> DEC, negative signal -> INC
+- Dynamic sizing logic with base MW, max MW, and risk-budget cap
+- Daily risk cap that stops new trades after the loss limit is breached
+- Backtested PnL and equity curve
+- Sharpe, max drawdown, hit rate
+- Regime performance by volatility regime, time regime (on-peak/off-peak), and signal regime
+
+Additional outputs:
+- `outputs/backtests/virtuals_backtest_trades.csv`
+- `outputs/backtests/regime_performance.csv`
+- `outputs/figures/virtuals_equity_curve.png`
